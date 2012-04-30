@@ -1,4 +1,9 @@
 #!/usr/bin/python
+## Copyright 2012 Orri Ganel All rights reserved.
+## Author: Orri Ganel
+## Version: 0.1
+## Written while working at RioRey, Inc.
+##
 ## NOTES:
 ## - virtual interfaces cannot be used b/c no utility reports packets/bytes against VIFs
 ## TODO:
