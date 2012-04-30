@@ -1,0 +1,441 @@
+#!/usr/bin/python
+## NOTES:
+## - virtual interfaces cannot be used b/c no utility reports packets/bytes against VIFs
+## TODO:
+## - extract events (0pps-bounded stretches of non-0pps)
+##   - apply leniency for events (# of consecutive 0-readings allowed before an event is declared over)
+import sys, commands, time, re, operator
+from copy import deepcopy as copy
+
+def usage():
+    print "usage: rate [GLOBAL OPTIONS] [<interface_n> [INTERFACE_N OPTIONS]] [-E EXPRESSION]"
+    print "GLOBAL OPTIONS"
+    print "\t-s n; Sleep for approximately N seconds between polls"
+    print "\t-i; write updates Inline instead of printing each stat on a new line"
+    print "\t-n; No headers (data only) - useful for piping"
+    print "\t-e n; Threshold of n non-0 readings for Events before being displayed (default of 10)"
+    print
+    print "INTERFACE OPTIONS"
+    print "\t-r; show rate for Rx (default)"
+    print "\t-t; show rate for just Tx (-r and -t for both rx and tx)"
+    print "\t-p; show rate in Packets (default)"
+    print "\t-b; show rate just in Bytes (-p and -b for both packets and bytes)"
+    print
+    print "EXPRESSION"
+    print "\tThe expression must be valid Python, with the following constraints:"
+    print "\t - A name may be optionally specified using the syntax <expr> as <name>"
+    print "\t - The only alphabetical characters allowed must be of the form <link name>[.<direction>][.<kind>] or a name used in another expression"
+    print "\t - An expression cannot refer to itself."
+    print "\t - If two expressions share a name, they cannot refer to each other."
+    print "\t - If two expressions share a name, references to that name will be interpreted arbitrarily as referring to one or the other"
+    print "\t - Only one level of indirection is allowed: an expression may not refer to an expression which refers to another expression"
+    print "\t - If direction is unspecified, rx is assumed.  If kind is unspecified, packets is assumed.  If no name specified, '?' is used."
+    print
+    print "NOTES"
+    print " - Virtual Interfaces cannot be used because neither ifconfig nor ip reports against them."
+    print " - In expressions, only interfaces listed by `ip -s link` may be used"
+    print
+    print "EXAMPLES"
+    print "\trate"
+    print "\t\tSample the rate every second and report packets received on eth0"
+    print
+    print "\trate -s 2 eth2 -t eth3"
+    print "\t\tSample the rate every 2 seconds and report transmitted packets from eth2 and received packets on eth3"
+    print
+    print "\trate -i eth1 -p -b -t eth3 -t -r"
+    print "\t\tSample the rate every second and report transmitted bytes and packets from eth1 and received and transmitted packets on eth3 inline"
+    print
+    print '\trate eth0 -r -t -p -E "(1 - eth3 / (eth2.t + 1)) as dropped_wan" -E "(1 - eth2 / (eth3.t + 1)) as dropped_lan"'
+    print "\t\tSample the rate every second and report received and transmitted packets from eth0, 1 - received packets from eth3 / (transmitted packets from eth2 + 1) as dropped_wan, and 1 - received packets from eth2 / (transmitted packets from eth3 + 1) as dropped_lan"
+    print
+    print '\trate -E "(eth2.t.b+eth3.t.b)*8 as bps" -E "eth2.t.p+eth3.t.p as pps" -E "bps/pps as b/p"'
+    print "\t\tSample the rate every second and report the sum of bytes sent on eth2 and eth3 * 8 as bps (ie bits per second), the sum of packets sent out on eth2 and eth3 as pps, and the ratio of the two as b/p."
+    sys.exit(0)
+
+class SubstringDict(dict):
+    def __init__(self, *args, **kwargs):
+        return super(SubstringDict, self).__init__(*args, **kwargs)
+    def __getitem__(self, key):
+        matches = [k for k in self.keys() if str(k).startswith(str(key))]
+        if len(matches) == 1:
+            return super(SubstringDict, self).__getitem__(matches[0])
+        elif not matches:
+            raise KeyError(key)
+        else:
+            raise KeyError("Ambiguous key: '{0}' matches {1}".format(key, ", ".join(matches)))
+
+class Event:
+    def __init__(self, name):
+        self.name = name
+        self.done = False
+        self.stats = []
+        self.tot = self.avg = self.dur = 0
+    def __str__(self):
+        return "{0}\n\tDuration: {1} seconds\n\tTotal: {2}\n\tRate: {3}".format(self.name, self.dur, human_readable(self.tot, False), human_readable(self.avg, False))
+    def __radd__(self, stat):
+        return self + stat
+    def __add__(self, stat):
+        temp = copy(self)
+        temp.stats += [stat]
+        return temp
+    def __iadd__(self, stat):
+        self.stats += [stat]
+        return self
+    def end(self):
+        self.done = True
+        self.tot = sum(stat[1] for stat in self.stats)
+        self.dur = float(self.stats[-1][0] - self.stats[0][0] + resolution)
+        self.avg = self.tot/self.dur
+
+def expr_parse((name, expr)):
+    matches = re.findall("({0})\.?((?:r|t)[a-z]*)?\.?((?:p|b)[a-z]*)?".format("|".join(sorted(order, key=len, reverse=True))), expr) # look for longest matches first to allow e.g. eth2.101@eth2
+    all_alpha = re.findall("[a-zA-Z_][a-zA-Z_0-9]*", expr)
+    if [i for i in all_alpha if i not in reduce(operator.add, [list(match) for match in matches], list(names)) or i == name]:
+        print "Illegal reference in expression '{0}'.".format(name if name != "????" and names.count(name)==1 else expr)
+        return False
+    for match in matches:
+        link, direction, kind = match
+        expr = expr.replace(".".join(i for i in match if i), 'links["{0}"]["rate"]["{1}"]["{2}"]'.format(link, direction or "rx", kind or "packets"))
+    return expr
+
+def expand_refs((name,expr)):
+    matches = re.findall("(links){0}".format('\["(.*?)"\]'*4), expr)
+    all_alpha = re.findall("[a-zA-Z_][a-zA-Z_0-9]*", expr)
+    refs = [i for i in all_alpha if i not in reduce(operator.add, [list(match) for match in matches], [])]
+    for ref in refs:
+        expr = expr.replace(ref, "({0})".format(exprs[names.index(ref)]))
+    return expr
+
+def final_validate((name, expr)):
+    matches = re.findall("(links){0}".format('\["(.*?)"\]'*4), expr)
+    all_alpha = re.findall("[a-zA-Z_][a-zA-Z_0-9]*", expr)
+    if [i for i in all_alpha if i not in reduce(operator.add, [list(match) for match in matches], [])]:
+        print "Illegal reference in expression '{0}'.".format(name if name != "????" and names.count(name)==1 else expr)
+        return False
+    else:
+        return expr
+
+def expr_name(expr):
+    name = re.findall("as (.+)$", expr)
+    if name:
+        name = name[0]
+        expr = expr[:expr.rindex("as")]
+    else:
+        name = "????"
+    return [name, expr]
+
+def human_readable(stat, kind, rate=True, precision=0, end=False):
+    if end and not stat:
+        return "----"
+    prefixes = ["", "k", "M", "G", "T", "P", "E", "Z", "Y"]
+    if kind == "bytes":
+        stat *= 8
+    suffix = kind[0]+("ps" if rate else "") if kind else ""
+    temp = stat
+    ind = 0
+    while round(abs(temp), precision) >= 1000 and ind < (len(prefixes)-1):
+        temp /= 1000.0
+        ind += 1
+    temp = round(temp, precision)
+    if not precision:
+        temp = int(temp)
+    return "{0} {1}{2}".format(temp, prefixes[ind], suffix)
+
+def loop():
+    global link_header
+    if headers:
+        sys.stdout.write("{0}\n".format(commands.getoutput("date")))
+        sys.stdout.flush()
+    flag = False
+    for name in links.keys():
+        if name not in order:
+            flag = True
+            print "{0} is not a recognized interface".format(name),
+            del links[name]
+    if not links.keys() and not expressions:
+        print
+        usage()
+    elif flag:
+        print "- proceeding without it"
+    cmd = 'date +%s.%N && ip -s link | egrep "({0})" -A 5 | egrep "^( |[0-9])+$" && date +%s.%N'
+    while True:
+        outp = commands.getoutput(cmd.format("|".join(links.keys()))).split("\n")
+        before, after = outp.pop(0), outp.pop()
+        stats = zip(outp[::2],outp[1::2])
+        for name, link in sorted(links.items(), key=lambda x:order.index(x[0])):
+            rx, tx = stats[sorted(links.keys(), key=order.index).index(name)]
+            rbytes, rpackets = rx.split()[:2]
+            tbytes, tpackets = tx.split()[:2]
+            stat = {"rx":{"packets":rpackets, "bytes":rbytes},
+                    "tx":{"packets":tpackets, "bytes":tbytes}}
+            link["current"] = copy(link["next"])
+            for direction in link["next"]:
+                for kind in link["next"][direction]:
+                    link["next"][direction][kind] = int(stat[direction][kind])
+            link["stamp"], link["oldstamp"] = (float(after)+float(before))/2, link["stamp"]
+            if not link["oldstamp"]: continue
+            for direction in link["rate"]:
+                for kind in link["rate"][direction]:
+                    link["rate"][direction][kind] = (link["next"][direction][kind] - link["current"][direction][kind])/(link["stamp"]-link["oldstamp"])
+                    #link["rate"][direction][kind] = human_readable(link["rate"][direction][kind], kind)
+        for name, link in links.items():
+            if link["display"]:
+                for direction in link["display"]:
+                    for kind in link["display"][direction]:
+                        if link["rate"][direction][kind] != 0:
+                            if not events[name][direction][kind] or events[name][direction][kind][-1].done:
+                                events[name][direction][kind].append(Event("{0}.{1}.{2}".format(name, direction, kind)))
+                            events[name][direction][kind][-1] += (link["stamp"], link["rate"][direction][kind])
+                        else:
+                            if events[name][direction][kind] and not events[name][direction][kind][-1].done:
+                                events[name][direction][kind][-1].end()
+        if expressions:
+            for name, expr in expressions:
+                res = eval(expr, {}, {"links":links})
+                if res != 0:
+                    if not events[expr] or events[expr][-1].done:
+                        events[expr].append(Event(expr))
+                    events[expr][-1] += ((float(after)+float(before))/2, res)
+                else:
+                    if events[expr] and not events[expr][-1].done:
+                        events[expr][-1].end()
+        if not links.values()[0]["oldstamp"]:
+            for link in links.values():
+                link["first"] = copy(link["next"])
+                link["start"] = link["stamp"]
+            if headers:
+                link_header = " || ".join("{:^{width}}".format(name, width=11*len([k for d in links[name]["display"] for k in links[name]["display"][d]])-3)
+                                          for name in sorted([k for k in links.keys() if links[k]["display"]], key=lambda x:(sys.argv+[x]).index(x)))
+
+                header = " || ".join([" , ".join(["{:^8}".format("{0}.{1}".format(direction, kind[0]))
+                                                for direction in link["display"]
+                                                    for kind in link["display"][direction]])
+                                      for name, link in sorted(links.items(), key=lambda x:(sys.argv+[x[0]]).index(x[0])) if link["display"]])
+                if expressions:
+                    link_header += (" || " if link_opts else "") + " || ".join("{:^{width}}".format(name, width=max(9, len(name)+2)) for name, expr in expressions)
+                    header += (" || " if link_opts else "") + " || ".join("{:^{width}}".format("", width=max(9, len(name)+2)) for name, expr in expressions)
+                sys.stdout.write("{0}\n{1}\n{2}{3}".format(link_header,header,"-"*len(link_header),"\n" if inline else ""))
+                sys.stdout.flush()
+        else:
+            msg = " || ".join([" , ".join(['{:>8}'.format(human_readable(link["rate"][direction][kind], kind))
+                                         for direction in link["display"]
+                                             for kind in link["display"][direction]])
+                               for name, link in sorted(links.items(), key=lambda x:(sys.argv+[x[0]]).index(x[0])) if link["display"]])
+            if expressions:
+                msg += (" || " if link_opts else "") + " || ".join(['{:>{width}}'.format(human_readable(eval(expr,{},{"links":links}), False, precision=2),
+                                                                                         width=max(9,len(name)+2))
+                                                                    for name, expr in expressions])
+            sys.stdout.write("{0}{1}".format("\r\x1b[K" if inline else "\n" if links.values()[0]["oldstamp"] - links.values()[0]["start"] > resolution or headers else "", msg))
+            sys.stdout.flush()
+        time.sleep(resolution)
+
+def expr_total(expr):
+    expr = expr.replace("rate","last")
+    expr = "({0}) - ({1})".format(expr, expr.replace("last", "first"))
+    return expr
+
+def expr_total_rate(expr):
+    expr = expr_total(expr)
+    try:
+        link = re.findall('links\[([^\]]+)\]', expr)[0]
+        expr = "({0})/(links[{1}]['stamp']-links[{1}]['start'])".format(expr, link)
+    except IndexError:
+        expr = "''"
+    return expr
+
+columns = ["bytes", "packets"]
+
+# read options
+if "-h" in sys.argv:
+    usage()
+
+order = [re.findall("\d+?: ([^:]+):",line)[0] for line in commands.getoutput('ip -s link | egrep "\d+?: ([^:]+):"').split("\n")]
+
+link_opts = {}
+resolution = 1
+threshold = 10
+resflag = False
+exprflag = False
+thresholdflag = False
+current = None
+inline = False
+headers = True
+expressions = []
+for arg in sys.argv[1:]:
+    if not arg.startswith("-"):
+        if resflag:
+            try:
+                resolution = int(arg)
+            except ValueError:
+                usage()
+            resflag = False
+        elif exprflag:
+            expressions.append(expr_name(arg))
+            exprflag = False
+        elif thresholdflag:
+            try:
+                threshold = int(arg)
+            except ValueError:
+                usage()
+            thresholdflag = False
+        else:
+            current = arg
+            link_opts[current] = []
+    elif arg.startswith("-s"):
+        if len(arg) > 2:
+            try:
+                resolution = int(arg[2:])
+            except ValueError:
+                usage()
+        else:
+            resflag = True
+    elif arg.startswith("-E"):
+        if len(arg) > 2:
+            expressions.append(expr_name(arg[2:]))
+        else:
+            exprflag = True
+    elif arg.startswith("-e"):
+        if len(arg) > 2:
+            try:
+                threshold = int(arg[2:])
+            except ValueError:
+                usage()
+        else:
+            thresholdflag = True
+    elif arg == "-i":
+        inline = True
+    elif arg == "-n":
+        headers = False
+    elif not current:
+        current = "eth0"
+        if "eth0" not in sys.argv:
+            sys.argv.insert(1,"eth0")
+        link_opts[current] = []
+    if arg == "-b":
+        link_opts[current].append("bytes")
+    elif arg == "-p":
+        link_opts[current].append("packets")
+    elif arg == "-r":
+        link_opts[current].append("rx")
+    elif arg == "-t":
+        link_opts[current].append("tx")
+
+if not link_opts and not expressions:
+    sys.argv.insert(1, "eth0")
+    link_opts["eth0"] = []
+
+if expressions:
+    ln = 1
+    while ln != len(expressions):
+        ln = len(expressions)
+        names, exprs = zip(*expressions)
+        for i, expr in enumerate(exprs):
+            if not expr_parse((names[i], expr)):
+                expressions.pop(i)
+    names, exprs = zip(*expressions)
+    expressions = zip(names, map(expr_parse, expressions))
+    names, exprs = zip(*expressions)
+    expressions = zip(names, map(expand_refs, expressions))
+    names, exprs = zip(*expressions)
+    expressions = zip(names, map(final_validate,expressions))
+    expressions = [(name, expr) for name, expr in expressions if expr]
+
+if not link_opts and not expressions:
+    usage()
+
+# interpret options
+expr_links = [(name, []) for name in reduce(operator.add, [re.findall('links\["([^"]+)"\]', expr) for name, expr in expressions], [])]
+events = {}
+links = {}
+for name, options in link_opts.items() + expr_links:
+    if name in links.keys():
+        continue
+    if "rx" not in options and "tx" not in options:
+        options.append("rx")
+    if "bytes" not in options and "packets" not in options:
+        options.append("packets")
+    directions = [o for o in options if o.endswith("x")] if name in link_opts.keys() else []
+    kinds = [o for o in options if o not in directions] if name in link_opts.keys() else []
+    links[name] = {}
+    links[name]["display"] = {d:[k for k in kinds] for d in directions}
+    links[name]["rate"] = SubstringDict({"rx":SubstringDict({"packets":0,"bytes":0}),
+                                         "tx":SubstringDict({"packets":0,"bytes":0})})
+    links[name]["start"] = 0
+    links[name]["first"] = copy(links[name]["rate"])
+    links[name]["current"] = copy(links[name]["rate"])
+    links[name]["next"] = copy(links[name]["rate"])
+    links[name]["last"] = copy(links[name]["rate"])
+    links[name]["stamp"] = links[name]["old_stamp"] = None
+
+    if links[name]["display"]:
+        events[name] = {d:{k:[] for k in kinds} for d in directions}
+
+for name, expr in expressions:
+    events[expr] = []
+
+#print links
+#print events
+
+try:
+    loop()
+except KeyboardInterrupt:
+    if headers:
+        sys.stdout.write("\n{0}\n{1}\n".format("-"*len(link_header),commands.getoutput("date")))
+        sys.stdout.flush()
+    for name, link in links.items():
+        link["last"] = copy(link["next"])
+        for direction in link["last"]:
+            for kind in link["last"][direction]:
+                link["rate"][direction][kind] = (link["last"][direction][kind] - link["first"][direction][kind])/(link["stamp"]-link["start"])
+                #link["rate"][direction][kind] = human_readable(link["rate"][direction][kind], kind)
+    for name, link in links.items():
+        for direction in link["display"]:
+            for kind in link["display"][direction]:
+                if events[name][direction][kind] and not events[name][direction][kind][-1].done:
+                    events[name][direction][kind][-1].end()
+    for name, expr in expressions:
+        if events[expr] and not events[expr][-1].done:
+            events[expr][-1].end()
+    if headers:
+        # shouldn't matter which timestamps I look at since all stats are pulled out at a time per poll
+        sys.stdout.write("Duration: {:0.02f} seconds\n".format(round(links.values()[0]["stamp"]-links.values()[0]["start"],2)))
+        sys.stdout.write("Totals:\n")
+        msg = " || ".join([" , ".join(['{:>8}'.format(human_readable(link["last"][direction][kind] - link["first"][direction][kind], kind, rate=False))
+                                         for direction in link["display"]
+                                             for kind in link["display"][direction]])
+                               for name, link in sorted(links.items(), key=lambda x:(sys.argv+[x[0]]).index(x[0])) if link["display"]])
+        if expressions:
+            msg += (" || " if link_opts else "") + " || ".join(['{:>{width}}'.format(human_readable(eval(expr_total(expr), {}, {"links":links}), False, precision=2, end=True),
+                                                                                     width=max(9,len(name)+2))
+                                                                for name, expr in expressions])
+        sys.stdout.write(msg+"\n")
+        sys.stdout.write("Total Rates:\n")
+        msg = " || ".join([" , ".join(['{:>8}'.format(human_readable(link["rate"][direction][kind], kind))
+                                         for direction in link["display"]
+                                             for kind in link["display"][direction]])
+                               for name, link in sorted(links.items(), key=lambda x:(sys.argv+[x[0]]).index(x[0])) if link["display"]])
+        if expressions:
+            msg += (" || " if link_opts else "") + " || ".join(['{:>{width}}'.format(human_readable(eval(expr_total_rate(expr),{},{"links":links}), False, precision=2, end=True),
+                                                                                     width=max(9,len(name)+2))
+                                                                for name, expr in expressions])
+        sys.stdout.write(msg+"\n")
+        printedEvents = False
+        for name, link in sorted(links.items(), key=lambda x:(sys.argv+[x[0]]).index(x[0])):
+            if link["display"]:
+                for direction in link["display"]:
+                    for kind in link["display"][direction]:
+                        for event in filter(lambda e:len(e.stats)>=threshold, events[name][direction][kind]):
+                            if not printedEvents:
+                                sys.stdout.write("Events:\n")
+                                printedEvents = True
+                            sys.stdout.write("\n".join(["\t{0}".format(line) for line in str(event).split("\n")])+"\n")
+        for name, expr in expressions:
+            for event in filter(lambda e:len(e.stats)>=threshold, events[expr]):
+                if not printedEvents:
+                    sys.stdout.write("Events:\n")
+                    printedEvents = True
+                sys.stdout.write("\n".join(["\t{0}".format(line) for line in str(event).split("\n")])+"\n")
+        sys.stdout.flush()
+    else:
+        print
+    sys.exit(0)
