@@ -254,7 +254,11 @@ columns = ["bytes", "packets"]
 if "-h" in sys.argv:
     usage()
 
-order = [re.findall("\d+?: ([^:]+):",line)[0] for line in commands.getoutput('ip -s link | egrep "\d+?: ([^:]+):"').split("\n")]
+try:
+        order = [re.findall("\d+?: ([^:]+):",line)[0] for line in commands.getoutput('ip -s link | egrep "\d+?: ([^:]+):"').split("\n")]
+except IndexError:
+        print "rate is a unix-only utility."
+        sys.exit(1)
 
 link_opts = {}
 resolution = 1
