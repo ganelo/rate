@@ -256,6 +256,10 @@ if "-h" in sys.argv:
 
 try:
         order = [re.findall("\d+?: ([^:]+):",line)[0] for line in commands.getoutput('ip -s link | egrep "\d+?: ([^:]+):"').split("\n")]
+        if len(order) > 1:
+            default = [i for i in order if i != "lo"][0]
+        else:
+            default = order[0]
 except IndexError:
         print "rate is a unix-only utility."
         sys.exit(1)
@@ -316,9 +320,9 @@ for arg in sys.argv[1:]:
     elif arg == "-n":
         headers = False
     elif not current:
-        current = "eth0"
-        if "eth0" not in sys.argv:
-            sys.argv.insert(1,"eth0")
+        current = default
+        if default not in sys.argv:
+            sys.argv.insert(1,default)
         link_opts[current] = []
     if arg == "-b":
         link_opts[current].append("bytes")
@@ -330,8 +334,8 @@ for arg in sys.argv[1:]:
         link_opts[current].append("tx")
 
 if not link_opts and not expressions:
-    sys.argv.insert(1, "eth0")
-    link_opts["eth0"] = []
+    sys.argv.insert(1, default)
+    link_opts[default] = []
 
 if expressions:
     ln = 1
